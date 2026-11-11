@@ -5,8 +5,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/cel/matching"
 	ivpolengine "github.com/kyverno/kyverno/pkg/cel/policies/ivpol/engine"
 	"github.com/kyverno/kyverno/pkg/config"
-	imageverifycache "github.com/kyverno/kyverno/pkg/image/verification/cache"
-	corev1 "k8s.io/api/core/v1"
+	iveval "github.com/kyverno/kyverno/pkg/image/verification/evaluator"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -27,13 +26,16 @@ func secretLister(kubeClient kubernetes.Interface) corev1listers.SecretLister {
 // image-verify cache so results stay deterministic. The returned provider exposes Fetch() to poll
 // reconciliation.
 func NewIvpolEngine(mgr ctrl.Manager, kubeClient kubernetes.Interface) (ivpolengine.Engine, ivpolengine.Provider, error) {
-	provider, err := ivpolengine.NewKubeProvider(mgr, nil, false)
+	provider, err := ivpolengine.NewKubeProvider(iveval.NewCompiler(secretLister(kubeClient)), mgr, nil, false)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	nsResolver := func(ns string) *corev1.Namespace { return nil }
-	engine := ivpolengine.NewEngine(provider, nsResolver, matching.NewMatcher(), secretLister(kubeClient), imageverifycache.DisabledImageVerifyCache(), config.NewDefaultConfiguration(false))
+	nsResolver, err := namespaceResolverForManager(mgr)
+	if err != nil {
+		return nil, nil, err
+	}
+	engine := ivpolengine.NewEngine(provider, nsResolver, matching.NewMatcher(), secretLister(kubeClient), nil, config.NewDefaultConfiguration(false))
 	return engine, provider, nil
 }
 
@@ -43,12 +45,15 @@ func NewIvpolEngine(mgr ctrl.Manager, kubeClient kubernetes.Interface) (ivpoleng
 func NewIvpolEngineWithExceptions(mgr ctrl.Manager, kubeClient kubernetes.Interface) (ivpolengine.Engine, ivpolengine.Provider, error) {
 	polexLister := celengine.NewManagerPolicyExceptionLister(mgr.GetClient(), "")
 
-	provider, err := ivpolengine.NewKubeProvider(mgr, polexLister, true)
+	provider, err := ivpolengine.NewKubeProvider(iveval.NewCompiler(secretLister(kubeClient)), mgr, polexLister, true)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	nsResolver := func(ns string) *corev1.Namespace { return nil }
-	engine := ivpolengine.NewEngine(provider, nsResolver, matching.NewMatcher(), secretLister(kubeClient), imageverifycache.DisabledImageVerifyCache(), config.NewDefaultConfiguration(false))
+	nsResolver, err := namespaceResolverForManager(mgr)
+	if err != nil {
+		return nil, nil, err
+	}
+	engine := ivpolengine.NewEngine(provider, nsResolver, matching.NewMatcher(), secretLister(kubeClient), nil, config.NewDefaultConfiguration(false))
 	return engine, provider, nil
 }

@@ -6,7 +6,7 @@ import (
 	"reflect"
 
 	"github.com/go-logr/logr"
-	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+	"github.com/kyverno/kyverno/api/kyverno"
 	kyvernov2 "github.com/kyverno/kyverno/api/kyverno/v2"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	admissionutils "github.com/kyverno/kyverno/pkg/utils/admission"
@@ -105,9 +105,9 @@ func getTriggerForCreateOperation(client dclient.Interface, spec kyvernov2.Updat
 	return trigger, err
 }
 
-func GetResource(client dclient.Interface, resourceSpec kyvernov1.ResourceSpec, urSpec kyvernov2.UpdateRequestSpec, log logr.Logger) (resource *unstructured.Unstructured, err error) {
+func GetResource(client dclient.Interface, resourceSpec kyverno.ResourceSpec, urSpec kyvernov2.UpdateRequestSpec, log logr.Logger) (resource *unstructured.Unstructured, err error) {
 	obj := resourceSpec
-	if reflect.DeepEqual(obj, kyvernov1.ResourceSpec{}) {
+	if reflect.DeepEqual(obj, kyverno.ResourceSpec{}) {
 		obj = urSpec.GetResource()
 		resourceSpec = obj
 	}
@@ -119,6 +119,38 @@ func GetResource(client dclient.Interface, resourceSpec kyvernov1.ResourceSpec, 
 		"kind", resourceSpec.GetKind(),
 		"apiVersion", resourceSpec.GetAPIVersion())
 	if obj.GetUID() != "" {
+		// The UID recorded in the UpdateRequest must match a live resource. If it does
+		// not, the originating admission request was rejected by the API server (e.g.
+		// AlreadyExists), or the resource was deleted (and possibly recreated) before
+		// this UpdateRequest was processed. Do NOT fall back to the admission request
+		// payload: it may carry mutated state that never got persisted and must not
+		// drive policy evaluation. See https://github.com/kyverno/kyverno/issues/16566.
+		notFound := func() error {
+			return fmt.Errorf("trigger resource %s/%s %s/%s with uid %s not found in the cluster, the corresponding admission request may have been rejected by the API server",
+				resourceSpec.GetAPIVersion(), resourceSpec.GetKind(), obj.GetNamespace(), obj.GetName(), obj.GetUID())
+		}
+
+		if obj.GetName() != "" {
+			// Fetch by name and verify the UID. Listing the namespace and scanning for the
+			// UID gives the same answer but costs O(N) per lookup: a generateExisting pass
+			// over a namespace with N triggers then performs N lists of N objects.
+			// See https://github.com/kyverno/kyverno/issues/17700.
+			namespace := resourceSpec.GetNamespace()
+			if resourceSpec.Kind == "Namespace" {
+				namespace = ""
+			}
+			live, err := client.GetResource(context.TODO(), resourceSpec.GetAPIVersion(), resourceSpec.GetKind(), namespace, obj.GetName())
+			if err != nil && !errors.IsNotFound(err) {
+				return nil, fmt.Errorf("failed to get trigger resource %s/%s %s/%s: %w",
+					resourceSpec.GetAPIVersion(), resourceSpec.GetKind(), obj.GetNamespace(), obj.GetName(), err)
+			}
+			if live != nil && live.GetUID() == obj.GetUID() {
+				return live, nil
+			}
+			return nil, notFound()
+		}
+
+		// No name to fetch by: list the namespace and match on UID.
 		triggers, err := client.ListResource(context.TODO(), resourceSpec.GetAPIVersion(), resourceSpec.GetKind(), resourceSpec.GetNamespace(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list trigger resources: %v", err)
@@ -130,25 +162,13 @@ func GetResource(client dclient.Interface, resourceSpec kyvernov1.ResourceSpec, 
 			}
 		}
 
-		// The UID recorded in the UpdateRequest does not match any live resource.
-		// This means the originating admission request was rejected by the API server
-		// (e.g. AlreadyExists), or the resource was deleted (and possibly recreated)
-		// before this UpdateRequest was processed. Do NOT fall back to the admission
-		// request payload: it may carry mutated state that never got persisted and
-		// must not drive policy evaluation. See https://github.com/kyverno/kyverno/issues/16566.
-		return nil, fmt.Errorf("trigger resource %s/%s %s/%s with uid %s not found in the cluster, the corresponding admission request may have been rejected by the API server",
-			resourceSpec.GetAPIVersion(), resourceSpec.GetKind(), obj.GetNamespace(), obj.GetName(), obj.GetUID())
+		return nil, notFound()
 	} else if obj.GetName() != "" {
 		if resourceSpec.Kind == "Namespace" {
 			resourceSpec.Namespace = ""
 		}
 		resource, err := client.GetResource(context.TODO(), resourceSpec.APIVersion, resourceSpec.Kind, resourceSpec.Namespace, resourceSpec.Name)
 		if err != nil {
-			if urSpec.GetRequestType() == kyvernov2.Mutate && errors.IsNotFound(err) && urSpec.Context.AdmissionRequestInfo.Operation == admissionv1.Delete {
-				log.V(4).Info("trigger resource does not exist for mutateExisting rule", "operation", urSpec.Context.AdmissionRequestInfo.Operation)
-				return nil, nil
-			}
-
 			return nil, fmt.Errorf("resource %s/%s/%s/%s: %v", resourceSpec.APIVersion, resourceSpec.Kind, resourceSpec.Namespace, resourceSpec.Name, err)
 		}
 

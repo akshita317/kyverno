@@ -18,7 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// legacyPolicyCheckTimeout bounds the direct-list count plus the Deployment
+// legacyPolicyCheckTimeout bounds the metadata-list count plus the Deployment
 // lookup and Event creation below, so a slow or unreachable API server can't
 // block kyverno-init -- and therefore the main container it gates -- forever.
 // A timeout is treated like any other failure here: logged, never fatal.
@@ -27,11 +27,11 @@ const legacyPolicyCheckTimeout = 30 * time.Second
 // checkLegacyPolicies counts the legacy (non policies.kyverno.io) policy
 // custom resources still present in the cluster -- ClusterPolicy, Policy,
 // CleanupPolicy, ClusterCleanupPolicy, and legacy PolicyException -- using a
-// direct list through the typed client, since kyverno-init runs once at
-// startup, before any controller has a synced cache. When any of them are
-// still present, it emits a single L0 error log and a single aggregate
-// Warning Event attached to the admission-controller Deployment, with
-// migration guidance.
+// metadata-only list through the metadata client, since kyverno-init runs
+// once at startup, before the 30 s refresher used by the long-running
+// controllers exists. When any of them are still present, it emits a single
+// L0 error log and a single aggregate Warning Event attached to the
+// admission-controller Deployment, with migration guidance.
 //
 // This is purely observational: it fires whenever legacy CRs exist,
 // independent of any policy cleanup outcome or write-path enforcement
@@ -63,91 +63,25 @@ func checkLegacyPolicies(ctx context.Context, setup internal.SetupResult) {
 	// The Event Note has its own, much shorter, size limit than a log message, so it
 	// gets its own terse summary rather than reusing the verbose L0 log message.
 	if note, ok := deprecations.LegacyPolicyEventNote(counts); ok {
-		emitLegacyPolicyEvent(ctx, logger, setup, note)
+		emitDeprecationEvent(ctx, logger, setup, event.LegacyPolicyPresent, note)
 	}
 }
 
-// countLegacyPolicies is a thin adapter from the typed client to
+// countLegacyPolicies is a thin adapter from the metadata client to
 // deprecations.CountLegacyPolicies, the shared pure counting core also used
-// by the admission-controller and cleanup-controller gauge callbacks (which
-// instead adapt from synced informer listers).
+// by the admission-controller and cleanup-controller gauge callbacks.
 func countLegacyPolicies(ctx context.Context, setup internal.SetupResult) (map[string]int, error) {
-	counters := map[string]deprecations.KindCounter{
-		"ClusterPolicy": func() (int, error) {
-			list, err := setup.KyvernoClient.KyvernoV1().ClusterPolicies().List(ctx, metav1.ListOptions{})
-			if err != nil {
-				// A missing legacy CRD (for example when PolicyException is not
-				// installed) lists as NotFound; treat it as zero present so one
-				// absent kind does not abort counting the others.
-				if apierrors.IsNotFound(err) {
-					return 0, nil
-				}
-				return 0, err
-			}
-			return len(list.Items), nil
-		},
-		"Policy": func() (int, error) {
-			list, err := setup.KyvernoClient.KyvernoV1().Policies(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				// A missing legacy CRD (for example when PolicyException is not
-				// installed) lists as NotFound; treat it as zero present so one
-				// absent kind does not abort counting the others.
-				if apierrors.IsNotFound(err) {
-					return 0, nil
-				}
-				return 0, err
-			}
-			return len(list.Items), nil
-		},
-		"CleanupPolicy": func() (int, error) {
-			list, err := setup.KyvernoClient.KyvernoV2().CleanupPolicies(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				// A missing legacy CRD (for example when PolicyException is not
-				// installed) lists as NotFound; treat it as zero present so one
-				// absent kind does not abort counting the others.
-				if apierrors.IsNotFound(err) {
-					return 0, nil
-				}
-				return 0, err
-			}
-			return len(list.Items), nil
-		},
-		"ClusterCleanupPolicy": func() (int, error) {
-			list, err := setup.KyvernoClient.KyvernoV2().ClusterCleanupPolicies().List(ctx, metav1.ListOptions{})
-			if err != nil {
-				// A missing legacy CRD (for example when PolicyException is not
-				// installed) lists as NotFound; treat it as zero present so one
-				// absent kind does not abort counting the others.
-				if apierrors.IsNotFound(err) {
-					return 0, nil
-				}
-				return 0, err
-			}
-			return len(list.Items), nil
-		},
-		"PolicyException": func() (int, error) {
-			list, err := setup.KyvernoClient.KyvernoV2().PolicyExceptions(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				// A missing legacy CRD (for example when PolicyException is not
-				// installed) lists as NotFound; treat it as zero present so one
-				// absent kind does not abort counting the others.
-				if apierrors.IsNotFound(err) {
-					return 0, nil
-				}
-				return 0, err
-			}
-			return len(list.Items), nil
-		},
-	}
-	return deprecations.CountLegacyPolicies(counters)
+	return deprecations.CountLegacyPolicies(ctx, deprecations.MetadataKindCounters(
+		setup.MetadataClient, "ClusterPolicy", "Policy", "CleanupPolicy", "ClusterCleanupPolicy", "PolicyException"))
 }
 
-// emitLegacyPolicyEvent creates a single aggregate Warning Event listing the
-// legacy kinds still present, attached to the admission-controller
-// Deployment. kyverno-init does not run the event generator/queue used by
-// the long-running controllers, so the Event is created directly through the
-// events client.
-func emitLegacyPolicyEvent(ctx context.Context, logger logr.Logger, setup internal.SetupResult, note string) {
+// emitDeprecationEvent creates a single Warning Event of the given reason, with the given note,
+// attached to the admission-controller Deployment. Shared by every kyverno-init startup
+// diagnostic that needs to surface an observational-only finding as a Kubernetes Event (legacy
+// policy custom resources, orphaned webhook configurations, ...) -- kyverno-init does not run
+// the event generator/queue used by the long-running controllers, so the Event is created
+// directly through the events client.
+func emitDeprecationEvent(ctx context.Context, logger logr.Logger, setup internal.SetupResult, reason event.Reason, note string) {
 	if setup.EventsClient == nil {
 		return
 	}
@@ -157,10 +91,10 @@ func emitLegacyPolicyEvent(ctx context.Context, logger logr.Logger, setup intern
 	deployment, err := setup.KubeClient.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Error(err, "admission-controller Deployment not found, skipping legacy policy event", "namespace", namespace, "name", deploymentName)
+			logger.Error(err, "admission-controller Deployment not found, skipping event", "namespace", namespace, "name", deploymentName, "reason", reason)
 			return
 		}
-		logger.Error(err, "failed to get admission-controller Deployment, skipping legacy policy event", "namespace", namespace, "name", deploymentName)
+		logger.Error(err, "failed to get admission-controller Deployment, skipping event", "namespace", namespace, "name", deploymentName, "reason", reason)
 		return
 	}
 
@@ -168,8 +102,8 @@ func emitLegacyPolicyEvent(ctx context.Context, logger logr.Logger, setup intern
 	reportingController := string(event.KyvernoInit)
 	now := time.Now()
 
-	// defensive: matches the Note truncation in pkg/event/controller.go's emitEvent,
-	// in case a future kind is added without updating deprecations.LegacyPolicyEventNote
+	// defensive: matches the Note truncation in pkg/event/controller.go's emitEvent, in case a
+	// future caller passes a note without going through its own already-bounded builder.
 	if len(note) > 1024 {
 		note = note[0:1021] + "..."
 	}
@@ -183,7 +117,7 @@ func emitLegacyPolicyEvent(ctx context.Context, logger logr.Logger, setup intern
 		ReportingController: reportingController,
 		ReportingInstance:   reportingController + "-" + hostname,
 		Action:              string(event.None),
-		Reason:              string(event.LegacyPolicyPresent),
+		Reason:              string(reason),
 		Regarding: corev1.ObjectReference{
 			APIVersion: "apps/v1",
 			Kind:       "Deployment",
@@ -196,6 +130,6 @@ func emitLegacyPolicyEvent(ctx context.Context, logger logr.Logger, setup intern
 	}
 
 	if _, err := setup.EventsClient.Events(namespace).Create(ctx, ev, metav1.CreateOptions{}); err != nil {
-		logger.Error(err, "failed to create legacy policy event")
+		logger.Error(err, "failed to create event", "reason", reason)
 	}
 }

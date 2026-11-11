@@ -7,16 +7,13 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/kyverno/kyverno/api/kyverno"
-	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	policyreportv1alpha2 "github.com/kyverno/kyverno/api/policyreport/v1alpha2"
 	reportsv1 "github.com/kyverno/kyverno/api/reports/v1"
-	"github.com/kyverno/kyverno/pkg/autogen"
 	"github.com/kyverno/kyverno/pkg/client/clientset/versioned"
-	kyvernov1informers "github.com/kyverno/kyverno/pkg/client/informers/externalversions/kyverno/v1"
 	policiesv1beta1informers "github.com/kyverno/kyverno/pkg/client/informers/externalversions/policies.kyverno.io/v1beta1"
-	kyvernov1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1"
 	policiesv1beta1listers "github.com/kyverno/kyverno/pkg/client/listers/policies.kyverno.io/v1beta1"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
+	metaclient "github.com/kyverno/kyverno/pkg/clients/metadata"
 	"github.com/kyverno/kyverno/pkg/controllers"
 	"github.com/kyverno/kyverno/pkg/controllers/report/utils"
 	"github.com/kyverno/kyverno/pkg/openreports"
@@ -30,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -62,8 +60,6 @@ type controller struct {
 	dclient  dclient.Interface
 
 	// listers
-	polLister      kyvernov1listers.PolicyLister
-	cpolLister     kyvernov1listers.ClusterPolicyLister
 	vpolLister     policiesv1beta1listers.ValidatingPolicyLister
 	nvpolLister    policiesv1beta1listers.NamespacedValidatingPolicyLister
 	ivpolLister    policiesv1beta1listers.ImageValidatingPolicyLister
@@ -78,6 +74,17 @@ type controller struct {
 	mapAlphaLister admissionregistrationv1alpha1listers.MutatingAdmissionPolicyLister
 	ephrLister     cache.GenericLister
 	cephrLister    cache.GenericLister
+	// polrLister/cpolrLister list permanent reports via the metadata client, used by the
+	// startup sweep (enqueueAllReports) to find legacy-only reports that no longer get events.
+	polrLister  cache.GenericLister
+	cpolrLister cache.GenericLister
+
+	// managedSelector matches reports managed by kyverno, used by the startup sweep.
+	managedSelector labels.Selector
+
+	// metaClient lists kyverno.io policies/clusterpolicies by metadata only, to gate the
+	// startup sweep on legacy policy presence (decision C2) without a typed legacy client.
+	metaClient metaclient.UpstreamInterface
 
 	// reportUUIDToPolicyCache maps report UUIDs to policies that affect them for targeted reconciliation.
 	// This avoids processing all reports when a single policy changes.
@@ -89,12 +96,9 @@ type controller struct {
 	backQueue  workqueue.TypedRateLimitingInterface[any]
 }
 
-// PolicyMapEntry holds an active traditional policy and its (autogen-expanded)
-// rule names. MergeReports reads only Rules; Policy is retained for caller
-// reference.
+// PolicyMapEntry holds the (autogen-expanded) rule names of an active policy.
 type PolicyMapEntry struct {
-	Policy kyvernov1.PolicyInterface
-	Rules  sets.Set[string]
+	Rules sets.Set[string]
 }
 
 func NewController(
@@ -102,8 +106,6 @@ func NewController(
 	orClient openreportsclient.OpenreportsV1alpha1Interface,
 	dclient dclient.Interface,
 	metadataFactory metadatainformers.SharedInformerFactory,
-	polInformer kyvernov1informers.PolicyInformer,
-	cpolInformer kyvernov1informers.ClusterPolicyInformer,
 	vpolInformer policiesv1beta1informers.ValidatingPolicyInformer,
 	nvpolInformer policiesv1beta1informers.NamespacedValidatingPolicyInformer,
 	ivpolInformer policiesv1beta1informers.ImageValidatingPolicyInformer,
@@ -116,6 +118,7 @@ func NewController(
 	mapV1Informer admissionregistrationv1informers.MutatingAdmissionPolicyInformer,
 	mapInformer admissionregistrationv1beta1informers.MutatingAdmissionPolicyInformer,
 	mapAlphaInformer admissionregistrationv1alpha1informers.MutatingAdmissionPolicyInformer,
+	metaClient metaclient.UpstreamInterface,
 ) controllers.Controller {
 	ephrInformer := metadataFactory.ForResource(reportsv1.SchemeGroupVersion.WithResource("ephemeralreports"))
 	cephrInformer := metadataFactory.ForResource(reportsv1.SchemeGroupVersion.WithResource("clusterephemeralreports"))
@@ -180,10 +183,12 @@ func NewController(
 		client:                  client,
 		dclient:                 dclient,
 		orClient:                orClient,
-		polLister:               polInformer.Lister(),
-		cpolLister:              cpolInformer.Lister(),
 		ephrLister:              ephrInformer.Lister(),
 		cephrLister:             cephrInformer.Lister(),
+		polrLister:              polrInformer.Lister(),
+		cpolrLister:             cpolrInformer.Lister(),
+		managedSelector:         selector,
+		metaClient:              metaClient,
 		cacheMu:                 cacheMu,
 		reportUUIDToPolicyCache: reportUUIDToPolicyCache,
 		frontQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
@@ -279,22 +284,6 @@ func NewController(
 				}
 			}
 		}
-	}
-	if _, err := controllerutils.AddEventHandlersT(
-		polInformer.Informer(),
-		func(o metav1.Object) { enqueueReportsForPolicy(o) },
-		func(_, o metav1.Object) { enqueueReportsForPolicy(o) },
-		func(o metav1.Object) { enqueueReportsForPolicy(o) },
-	); err != nil {
-		logger.Error(err, "failed to register event handlers")
-	}
-	if _, err := controllerutils.AddEventHandlersT(
-		cpolInformer.Informer(),
-		func(o metav1.Object) { enqueueReportsForPolicy(o) },
-		func(_, o metav1.Object) { enqueueReportsForPolicy(o) },
-		func(o metav1.Object) { enqueueReportsForPolicy(o) },
-	); err != nil {
-		logger.Error(err, "failed to register event handlers")
 	}
 	if vpolInformer != nil {
 		c.vpolLister = vpolInformer.Lister()
@@ -431,7 +420,62 @@ func NewController(
 	return &c
 }
 
+// legacyPoliciesPresent reports whether any kyverno.io v1 ClusterPolicy or Policy object still
+// exists (CRD absent counts as absent). It is a 1.20 migration check only, removable in 1.21 once
+// legacy policies can no longer exist (decision C2).
+func (c *controller) legacyPoliciesPresent(ctx context.Context) (bool, error) {
+	for _, resource := range []string{"clusterpolicies", "policies"} {
+		gvr := schema.GroupVersionResource{Group: "kyverno.io", Version: "v1", Resource: resource}
+		list, err := c.metaClient.Resource(gvr).List(ctx, metav1.ListOptions{Limit: 1})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		if len(list.Items) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// enqueueAllReports queues every managed permanent report for reconciliation. It is used once at
+// startup, gated on legacy policy presence, to prune legacy-only results from reports that no
+// longer receive write events now that legacy policies produce no new ephemeral reports
+// (decision C2). AddAfter is not rate-limited, so this must stay gated, not run unconditionally.
+func (c *controller) enqueueAllReports() {
+	if list, err := c.polrLister.List(c.managedSelector); err != nil {
+		logger.Error(err, "failed to list policy reports for startup sweep")
+	} else {
+		for _, item := range list {
+			itemMeta := item.(*metav1.PartialObjectMetadata)
+			c.backQueue.AddAfter(controllerutils.MetaObjectToName(itemMeta), enqueueDelay)
+		}
+	}
+	if list, err := c.cpolrLister.List(c.managedSelector); err != nil {
+		logger.Error(err, "failed to list cluster policy reports for startup sweep")
+	} else {
+		for _, item := range list {
+			itemMeta := item.(*metav1.PartialObjectMetadata)
+			c.backQueue.AddAfter(controllerutils.MetaObjectToName(itemMeta), enqueueDelay)
+		}
+	}
+}
+
 func (c *controller) Run(ctx context.Context, workers int) {
+	// startup sweep: drop legacy-only results from existing reports (decision C2).
+	// Fail closed when the legacy-policy presence check is indeterminate.
+	if present, err := c.legacyPoliciesPresent(ctx); err != nil {
+		// Fail closed: sweeping on an indeterminate result would add a cluster-wide read burst
+		// exactly when the API server is already unhealthy. The next leader start retries.
+		logger.Error(err, "could not determine whether legacy policies exist; skipping startup report sweep")
+	} else if present {
+		logger.V(2).Info("legacy kyverno.io policies present; sweeping every report once to prune legacy results")
+		c.enqueueAllReports()
+	} else {
+		logger.V(2).Info("no legacy kyverno.io policies present; skipping startup report sweep")
+	}
 	var group wait.Group
 	group.StartWithContext(ctx, func(ctx context.Context) {
 		controllerutils.Run(ctx, logger, ControllerName, time.Second, c.frontQueue, workers, maxRetries, c.frontReconcile)
@@ -440,39 +484,6 @@ func (c *controller) Run(ctx context.Context, workers int) {
 		controllerutils.Run(ctx, logger, ControllerName, time.Second, c.backQueue, workers, maxRetries, c.backReconcile)
 	})
 	group.Wait()
-}
-
-func (c *controller) createPolicyMap() (map[string]PolicyMapEntry, error) {
-	results := map[string]PolicyMapEntry{}
-	cpols, err := utils.FetchClusterPolicies(c.cpolLister)
-	if err != nil {
-		return nil, err
-	}
-	for _, cpol := range cpols {
-		key := cache.MetaObjectToName(cpol).String()
-		results[key] = PolicyMapEntry{
-			Policy: cpol,
-			Rules:  sets.New[string](),
-		}
-		for _, rule := range autogen.Default.ComputeRules(cpol, "") {
-			results[key].Rules.Insert(rule.Name)
-		}
-	}
-	pols, err := utils.FetchPolicies(c.polLister, metav1.NamespaceAll)
-	if err != nil {
-		return nil, err
-	}
-	for _, pol := range pols {
-		key := cache.MetaObjectToName(pol).String()
-		results[key] = PolicyMapEntry{
-			Policy: pol,
-			Rules:  sets.New[string](),
-		}
-		for _, rule := range autogen.Default.ComputeRules(pol, "") {
-			results[key].Rules.Insert(rule.Name)
-		}
-	}
-	return results, nil
 }
 
 func (c *controller) createVapMap() (sets.Set[string], error) {
@@ -847,10 +858,6 @@ func (c *controller) backReconcile(ctx context.Context, logger logr.Logger, _, n
 		}
 	}()
 	// aggregate reports
-	policyMap, err := c.createPolicyMap()
-	if err != nil {
-		return err
-	}
 	vapMap, err := c.createVapMap()
 	if err != nil {
 		return err
@@ -876,7 +883,6 @@ func (c *controller) backReconcile(ctx context.Context, logger logr.Logger, _, n
 		return err
 	}
 	maps := Maps{
-		Pol:    policyMap,
 		Vap:    vapMap,
 		Mappol: mappolMap,
 		Vpol:   vpolMap,
@@ -912,6 +918,18 @@ func (c *controller) backReconcile(ctx context.Context, logger logr.Logger, _, n
 			}
 			report = reportutils.NewPolicyReport(namespace, name, scope, c.orClient != nil)
 			controllerutils.SetOwner(report, owner.APIVersion, owner.Kind, owner.Name, owner.UID)
+		}
+		// C1: with no ephemeral reports to merge in, the permanent report is the only input;
+		// skip the write entirely if merging would produce no change (avoids a PUT on every resync).
+		if len(ephemeralReports) == 0 && report.GetResourceVersion() != "" {
+			desired := reportutils.DeepCopy(report)
+			reportutils.SetResults(desired, results...)
+			if utils.ReportsAreIdentical(report, desired) {
+				c.cacheMu.Lock()
+				c.reportUUIDToPolicyCache[string(report.GetUID())] = policySet
+				c.cacheMu.Unlock()
+				return nil
+			}
 		}
 		reportutils.SetResults(report, results...)
 		if report.GetResourceVersion() == "" {

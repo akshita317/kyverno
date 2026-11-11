@@ -1,24 +1,39 @@
 package policy
 
 import (
+	"context"
 	"testing"
 
+	"github.com/go-logr/logr"
 	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
-	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+	"github.com/kyverno/kyverno/api/kyverno"
 	kyvernov2 "github.com/kyverno/kyverno/api/kyverno/v2"
 	common "github.com/kyverno/kyverno/pkg/background/common"
+	"github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
+// captureURGenerator is a test double for generator.UpdateRequestGenerator
+// that records the UpdateRequest it was asked to generate instead of calling
+// the API server.
+type captureURGenerator struct {
+	captured []*kyvernov2.UpdateRequest
+}
+
+func (g *captureURGenerator) Generate(_ context.Context, _ versioned.Interface, resource *kyvernov2.UpdateRequest, _ logr.Logger) (*kyvernov2.UpdateRequest, error) {
+	g.captured = append(g.captured, resource.DeepCopy())
+	return nil, nil
+}
+
 func makeUR(n int) *kyvernov2.UpdateRequest {
 	ur := &kyvernov2.UpdateRequest{}
 	for i := 0; i < n; i++ {
 		ur.Spec.RuleContext = append(ur.Spec.RuleContext, kyvernov2.RuleContext{
 			Rule: "test-rule",
-			Trigger: kyvernov1.ResourceSpec{
+			Trigger: kyverno.ResourceSpec{
 				APIVersion: "v1",
 				Kind:       "Namespace",
 				Name:       "ns",
@@ -73,7 +88,7 @@ func TestSplitURNoAlias(t *testing.T) {
 		Labels: map[string]string{"a": "b"},
 	}
 	ur.Spec.Context.UserRequestInfo.Roles = []string{"role"}
-	ur.Status.GeneratedResources = []kyvernov1.ResourceSpec{
+	ur.Status.GeneratedResources = []kyverno.ResourceSpec{
 		{Name: "original"},
 	}
 
@@ -105,15 +120,15 @@ func TestNewGenerateURNGpolPolicyKey(t *testing.T) {
 }
 
 func TestFilterTriggersByNamespace(t *testing.T) {
-	mk := func(kind, ns, name string) *unstructured.Unstructured {
+	mk := func(kind, ns, name string) gpolTrigger {
 		u := &unstructured.Unstructured{}
 		u.SetKind(kind)
 		u.SetNamespace(ns)
 		u.SetName(name)
-		return u
+		return gpolTrigger{Unstructured: u}
 	}
 
-	triggers := []*unstructured.Unstructured{
+	triggers := []gpolTrigger{
 		mk("Deployment", "team-a", "dep-a"),
 		mk("Deployment", "team-b", "dep-b"),
 		mk("Namespace", "", "team-a"),

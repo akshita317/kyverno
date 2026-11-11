@@ -4,11 +4,10 @@
 package deprecations
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
-
-	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"strings"
 )
 
 var fieldIndexPattern = regexp.MustCompile(`\[\d+\]`)
@@ -75,13 +74,32 @@ func BuildKindWarning(group, version, kind string) (DeprecationWarning, bool) {
 }
 
 // IsLegacyPolicyKind reports whether kind (in the given group) is one of the legacy
-// kyverno.io policy kinds subject to the 1.20 write-time block on creates/spec-updates.
+// kyverno.io policy kinds subject to the 1.20 write-time block on legacy policy writes, which
+// covers creates and every top-level update, including unchanged-spec and metadata-only ones,
+// with only the narrow finalizer-removal and transitional status-subresource exceptions. It is an
+// allow-list, not an exclusion list: GlobalContextEntry, UpdateRequest, every policies.kyverno.io
+// kind, and every native Kubernetes kind are excluded by construction because they are simply
+// never in the replacements table, not because of any special-case check.
 func IsLegacyPolicyKind(group, kind string) bool {
 	if group != "kyverno.io" {
 		return false
 	}
 	_, ok := replacements[kind]
 	return ok
+}
+
+// legacyPolicyBlockError marks an error returned by BuildKindError, so callers that otherwise treat
+// load/parse failures as soft/skippable (e.g. the CLI silently skipping a non-Kyverno YAML file) can
+// tell this one apart and surface it as a hard failure instead.
+type legacyPolicyBlockError struct{ error }
+
+func (e legacyPolicyBlockError) Unwrap() error { return e.error }
+
+// IsLegacyPolicyBlockError reports whether err is (or wraps) the hard error returned by BuildKindError,
+// as opposed to an unrelated YAML/parsing error.
+func IsLegacyPolicyBlockError(err error) bool {
+	var e legacyPolicyBlockError
+	return errors.As(err, &e)
 }
 
 // BuildKindError returns a hard error rejecting a create or spec-changing update of a legacy
@@ -99,65 +117,44 @@ func BuildKindError(group, version, kind string) (error, bool) {
 	if version != "" {
 		apiVersion = fmt.Sprintf("%s/%s", group, version)
 	}
-	return fmt.Errorf(
-		"%s %s is no longer accepted for create, or for an update that changes spec; migrate to %s (policies.kyverno.io), see %s",
+	return legacyPolicyBlockError{fmt.Errorf(
+		"%s %s: Kyverno v1.20 removed execution of legacy kyverno.io policy types and no longer accepts create or update requests for them; the API remains available for read, list, export, and delete. Migrate to %s (policies.kyverno.io), see %s",
 		apiVersion, kind, replacement, MigrationGuideURL,
-	), true
-}
-
-// PolicyFieldWarnings returns field-level deprecation warnings for legacy policy fields.
-func PolicyFieldWarnings(policy kyvernov1.PolicyInterface) []DeprecationWarning {
-	var warnings []DeprecationWarning
-	spec := policy.GetSpec()
-	seen := map[string]struct{}{}
-	add := func(fieldPath string) {
-		if _, ok := seen[fieldPath]; ok {
-			return
-		}
-		seen[fieldPath] = struct{}{}
-		warnings = append(warnings, DeprecationWarning{
-			Group:   "kyverno.io",
-			Version: policyVersion(policy),
-			Kind:    policy.GetKind(),
-			Field:   fieldPath,
-			Message: fmt.Sprintf("%s: Validation failure actions enforce/audit are deprecated, use Enforce/Audit instead.", fieldPath),
-		})
-	}
-
-	if isDeprecatedValidationFailureAction(spec.ValidationFailureAction) {
-		add("spec.validationFailureAction")
-	}
-	for i, override := range spec.ValidationFailureActionOverrides {
-		if isDeprecatedValidationFailureAction(override.Action) {
-			add(fmt.Sprintf("spec.validationFailureActionOverrides[%d].action", i))
-		}
-	}
-	for i, rule := range spec.Rules {
-		if rule.Validation != nil && rule.Validation.FailureAction != nil && isDeprecatedValidationFailureAction(*rule.Validation.FailureAction) {
-			add(fmt.Sprintf("spec.rules[%d].validate.failureAction", i))
-		}
-		if rule.Validation != nil {
-			for j, override := range rule.Validation.FailureActionOverrides {
-				if isDeprecatedValidationFailureAction(override.Action) {
-					add(fmt.Sprintf("spec.rules[%d].validate.failureActionOverrides[%d].action", i, j))
-				}
-			}
-		}
-	}
-	return warnings
-}
-
-func isDeprecatedValidationFailureAction(action kyvernov1.ValidationFailureAction) bool {
-	return action == "enforce" || action == "audit"
+	)}, true
 }
 
 func NormalizeFieldPath(field string) string {
 	return fieldIndexPattern.ReplaceAllString(field, "[]")
 }
 
-func policyVersion(policy kyvernov1.PolicyInterface) string {
-	if object, ok := policy.(interface{ GetObjectKind() schema.ObjectKind }); ok {
-		return object.GetObjectKind().GroupVersionKind().Version
+// GlobalContextEntry projection language constants. A projection sets exactly one of
+// jmesPath or expression (enforced by GlobalContextEntryProjection.Validate()); these are
+// the two values every admission warning, CLI warning, and usage metric around that choice
+// should use, so the three sites classify a projection the same way instead of drifting.
+const (
+	ProjectionLanguageJMESPath = "jmespath"
+	ProjectionLanguageCEL      = "cel"
+)
+
+// ProjectionLanguage reports which language a GlobalContextEntry projection uses, given its
+// jmesPath and expression fields.
+func ProjectionLanguage(jmesPath, expression string) string {
+	if jmesPath != "" {
+		return ProjectionLanguageJMESPath
 	}
-	return ""
+	return ProjectionLanguageCEL
+}
+
+// BuildProjectionWarning returns a field-level deprecation warning naming the given
+// GlobalContextEntry projection field paths (for example "spec.projections[0].jmesPath")
+// that still use jmesPath, pointing at the replacement expression (CEL) field.
+func BuildProjectionWarning(paths []string) DeprecationWarning {
+	fields := strings.Join(paths, ", ")
+	return DeprecationWarning{
+		Field: fields,
+		Message: fmt.Sprintf(
+			"%s is deprecated and will be removed in 1.21; migrate to the projection's expression (CEL) field instead",
+			fields,
+		),
+	}
 }
